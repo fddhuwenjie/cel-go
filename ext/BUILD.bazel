@@ -54,6 +54,7 @@ go_test(
     name = "go_default_test",
     size = "small",
     srcs = [
+        "attributereads_bind_test.go",
         "bindings_test.go",
         "comprehensions_test.go",
         "encoders_test.go",

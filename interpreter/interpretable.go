@@ -1376,6 +1376,15 @@ func (fold *evalFold) Exec(frame *ExecutionFrame) ref.Val {
 		return foldRange
 	}
 
+	// 属性读取追踪：把循环范围表达式本次解析出的顶层输入路径记录到 folder，供迭代变量
+	// 映射为具体元素路径（如 items[0].price）。范围不是顶层属性时留空，迭代变量的读取
+	// 将不可回溯而不产生路径。
+	if tr := frame.AttrReadTracker(); tr != nil {
+		if rangePath, found := tr.attributePath(fold.iterRange); found {
+			f.readRangePath = rangePath
+		}
+	}
+
 	// Short-circuit the iteration if the range is empty.
 	if sizer, ok := foldRange.(traits.Sizer); ok && sizer.Size() == types.IntZero {
 		res := f.evalResult()
@@ -1979,12 +1988,28 @@ type folder struct {
 	interrupted   bool
 	computeResult bool
 	listV1Fold    bool
+
+	// 属性读取追踪相关的按次求值状态。
+
+	// readRangePath 是循环范围表达式解析出的顶层输入路径（如 "items"）；为空表示范围
+	// 无法回溯到顶层输入（例如另一个循环的结果），此时迭代变量不产生读取路径。
+	readRangePath string
+	// readQualValue 是当前迭代的列表下标或 Map 键的真实值，用于展开元素路径。
+	readQualValue any
+	// readIterCount 是无法提供键值的可迭代对象回退路径上的迭代计数。
+	readIterCount int64
+	// accuReadPath* 记录累加器（含 cel.bind 绑定变量）初始值对应的顶层输入路径。
+	accuReadPath       string
+	accuReadRooted     bool
+	accuReadPathLooked bool
 }
 
 func (f *folder) foldIterable(iterable traits.Iterable) ref.Val {
 	it := iterable.Iterator()
 	for it.HasNext() == types.True {
 		f.iterVar1Val = it.Next()
+		f.readQualValue = f.readIterCount
+		f.readIterCount++
 
 		cond := f.cond.Exec(f.frame)
 		if f.interrupted {
@@ -2023,6 +2048,8 @@ func (f *folder) FoldEntry(key, val any) bool {
 		f.iterVar1Val = key
 		f.iterVar2Val = val
 	}
+	// 记录本迭代真实的列表下标或 Map 键，供属性读取路径展开。
+	f.readQualValue = key
 
 	// Terminate evaluation if evaluation is interrupted or the condition is not true and exhaustive
 	// eval is not enabled.
@@ -2052,24 +2079,7 @@ func (f *folder) FoldEntry(key, val any) bool {
 // computed and the iteration variables should be ignored.
 func (f *folder) ResolveName(name string) (any, bool) {
 	if name == f.accuVar {
-		if !f.initialized {
-			f.initialized = true
-			initVal := f.accu.Exec(f.frame.parent)
-			// Only substitute a mutable accumulator when the planner has proven that the
-			// accumulator cannot be aliased, and when evaluation is not exhaustive since
-			// exhaustive evaluation would apply in-place updates from untaken branches.
-			if f.mutableAccu && !f.exhaustive {
-				if l, isList := initVal.(traits.Lister); isList && l.Size() == types.IntZero {
-					initVal = types.NewMutableList(f.adapter)
-					f.mutableValue = true
-				}
-				if m, isMap := initVal.(traits.Mapper); isMap && m.Size() == types.IntZero {
-					initVal = types.NewMutableMap(f.adapter, map[ref.Val]ref.Val{})
-					f.mutableValue = true
-				}
-			}
-			f.accuVal = initVal
-		}
+		f.ensureAccuInitialized()
 		return f.accuVal, true
 	}
 	if !f.computeResult {
@@ -2107,6 +2117,82 @@ func (f *folder) IsLocalVariable(name string) bool {
 		}
 	}
 	return false
+}
+
+// ensureAccuInitialized lazily evaluates the accumulator init expression once, mirroring the
+// semantics of the previous inline initialization while also recording the init value's input
+// path for attribute read tracking (used by cel.bind bound variables).
+func (f *folder) ensureAccuInitialized() {
+	if f.initialized {
+		return
+	}
+	f.initialized = true
+	initVal := f.accu.Exec(f.frame.parent)
+	// Only substitute a mutable accumulator when the planner has proven that the
+	// accumulator cannot be aliased, and when evaluation is not exhaustive since
+	// exhaustive evaluation would apply in-place updates from untaken branches.
+	if f.mutableAccu && !f.exhaustive {
+		if l, isList := initVal.(traits.Lister); isList && l.Size() == types.IntZero {
+			initVal = types.NewMutableList(f.adapter)
+			f.mutableValue = true
+		}
+		if m, isMap := initVal.(traits.Mapper); isMap && m.Size() == types.IntZero {
+			initVal = types.NewMutableMap(f.adapter, map[ref.Val]ref.Val{})
+			f.mutableValue = true
+		}
+	}
+	f.accuVal = initVal
+	// cel.bind 等场景下累加器初始值可能直接来自某个顶层属性，记录其路径，使绑定变量上的
+	// 字段读取能够回溯到真实输入路径。
+	if tr := f.frame.parent.AttrReadTracker(); tr != nil {
+		f.accuReadPathLooked = true
+		if p, rooted := tr.attributePath(f.accu); rooted {
+			f.accuReadPath = p
+			f.accuReadRooted = true
+		}
+	}
+}
+
+// attrReadPrefix 返回局部变量在本次求值中对应的顶层输入路径前缀。
+//
+// 返回值含义：
+//   - handled=false：该变量不由本 folder 绑定，应由外层作用域继续解析；
+//   - handled=true、rooted=false：变量由本 folder 绑定但无法回溯到输入路径（Map 键
+//     变量、不可回溯范围的迭代变量、非常量累加器等），不产生读取记录；
+//   - handled=true、rooted=true：prefix 为可直接拼接字段片段的具体元素路径。
+func (f *folder) attrReadPrefix(name string) (prefix string, rooted, handled bool) {
+	if !f.computeResult && name == f.iterVar {
+		if f.listV1Fold {
+			// 列表迭代变量绑定到当前下标的元素。
+			if f.readRangePath == "" {
+				return "", false, true
+			}
+			return f.readRangePath + nativeReadSegment(f.adapter, f.readQualValue), true, true
+		}
+		// Map 迭代时 iterVar 是键本身（原始值），不存在对应的输入字段路径。
+		return "", false, true
+	}
+	if !f.computeResult && f.iterVar2 != "" && name == f.iterVar2 {
+		// Map 双变量迭代时 iterVar2 绑定到当前键对应的值。
+		if f.readRangePath == "" {
+			return "", false, true
+		}
+		return f.readRangePath + nativeReadSegment(f.adapter, f.readQualValue), true, true
+	}
+	if name == f.accuVar {
+		// 属性读取路径解析可能先于 ResolveName 发生（路径构建在解析之前），此处确保累加器
+		// 初始值已求值，以便拿到其输入路径。
+		if !f.accuReadPathLooked {
+			f.ensureAccuInitialized()
+		}
+		return f.accuReadPath, f.accuReadRooted, true
+	}
+	if f.frame.parent != nil {
+		if prefix, rooted, handled := f.frame.parent.attrReadPrefix(name); handled {
+			return prefix, rooted, true
+		}
+	}
+	return "", false, false
 }
 
 // UnknownAttributePatterns implements the PartialActivation interface returning the unknown patterns
@@ -2163,6 +2249,13 @@ func (f *folder) reset() {
 	f.interrupted = false
 	f.computeResult = false
 	f.listV1Fold = false
+
+	f.readRangePath = ""
+	f.readQualValue = nil
+	f.readIterCount = 0
+	f.accuReadPath = ""
+	f.accuReadRooted = false
+	f.accuReadPathLooked = false
 }
 
 // InterruptError is a specialized error type used to signal that program evaluation should check

@@ -1496,6 +1496,9 @@ func applyQualifiers(vars Activation, obj any, qualifiers []Qualifier) (any, boo
 				return nil, false, err
 			}
 			if !present {
+				// 可选限定未命中时，字段存在性已经完成一次成功的检查，记录该限定片段；
+				// 路径在返回 OptionalNone 前提交。
+				trackConstantQualifier(vars, qual)
 				// We return optional none here with a presence of 'false' as the layers
 				// above will attempt to call types.OptionalOf() on a present value if any
 				// of the qualifiers is optional.
@@ -1512,6 +1515,10 @@ func applyQualifiers(vars Activation, obj any, qualifiers []Qualifier) (any, boo
 				return nil, false, err
 			}
 		}
+		// 限定成功应用（含 has 字段存在性检查返回 false 的情形），把字段名/常量下标片段
+		// 追加到当前读取路径；动态下标类型的限定器不是 ConstantQualifier，其片段在
+		// attrQualify / attrQualifyIfPresent 中按真实解析值追加。
+		trackConstantQualifier(vars, qual)
 		obj = qualObj
 	}
 	return obj, isOpt, nil
@@ -1527,6 +1534,9 @@ func attrQualify(fac AttributeFactory, vars Activation, obj any, qualAttr Attrib
 	if err != nil {
 		return nil, err
 	}
+	// 将本次解析出的真实下标值展开到外层属性读取路径；若随后的限定失败，外层路径会整体
+	// 丢弃，而作为下标的内部属性读取（qualAttr.Resolve）已经独立记录。
+	trackResolvedQualifier(vars, qual)
 	return qual.Qualify(vars, obj)
 }
 
@@ -1542,6 +1552,9 @@ func attrQualifyIfPresent(fac AttributeFactory, vars Activation, obj any, qualAt
 	if err != nil {
 		return nil, false, err
 	}
+	// 存在性检查场景下，无论被检查字段是否存在，下标键值的读取均已成功完成，按真实取值
+	// 展开记录片段。
+	trackResolvedQualifier(vars, qual)
 	return qual.QualifyIfPresent(vars, obj, presenceOnly)
 }
 

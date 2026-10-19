@@ -52,6 +52,9 @@ type evalContext struct {
 	// memory provides the context for tracking peak memory during evaluation.
 	memory *types.MemoryTracker
 
+	// attrReads provides the context for tracking input attribute reads during evaluation.
+	attrReads *AttrReadTracker
+
 	// ctx is the context for async call implementations to use.
 	ctx context.Context
 
@@ -95,6 +98,10 @@ type ExecutionFrame struct {
 
 	// costTracker provides direct access to the active CostTracker for this evaluation pass.
 	costTracker *CostTracker
+
+	// attrReadTracker provides direct access to the active attribute read tracker for this
+	// evaluation pass.
+	attrReadTracker *AttrReadTracker
 }
 
 // Scope returns the local activation scope for this frame, if present.
@@ -189,6 +196,7 @@ func (f *ExecutionFrame) Close() {
 		f.ctx.state = nil
 		f.ctx.costs = nil
 		f.ctx.memory = nil
+		f.ctx.attrReads = nil
 		f.ctx.interrupted.Store(false)
 		f.ctx.interruptCheckCount.Store(0)
 		f.ctx.interruptCheckFrequency = 0
@@ -197,6 +205,7 @@ func (f *ExecutionFrame) Close() {
 	f.ctx = nil
 	f.parent = nil
 	f.costTracker = nil
+	f.attrReadTracker = nil
 	f.functions = nil
 	if f.vars != nil {
 		f.vars = nil
@@ -215,6 +224,7 @@ func (f *ExecutionFrame) Push(activation Activation) *ExecutionFrame {
 	child.parent = f
 	child.ctx = f.ctx
 	child.costTracker = f.costTracker
+	child.attrReadTracker = f.attrReadTracker
 	child.scope = activation
 	// Scopes pushed during evaluation never supply late-bound functions, so the child inherits
 	// the bindings resolved for the evaluation rather than searching its own hierarchy.
@@ -233,6 +243,7 @@ func (f *ExecutionFrame) Pop() *ExecutionFrame {
 	f.functions = nil
 	f.ctx = nil
 	f.costTracker = nil
+	f.attrReadTracker = nil
 	if f.vars != nil {
 		f.vars = nil
 		clear(f.lazyVars)
@@ -384,6 +395,37 @@ func (f *ExecutionFrame) SetCostTracker(tracker *CostTracker) {
 	}
 	f.ctx.costs = tracker
 	f.costTracker = tracker
+}
+
+// AttrReadTracker returns the active attribute read tracker for this evaluation pass, or nil.
+func (f *ExecutionFrame) AttrReadTracker() *AttrReadTracker {
+	if f == nil {
+		return nil
+	}
+	return f.attrReadTracker
+}
+
+// SetAttrReadTracker sets the active attribute read tracker for this evaluation pass.
+func (f *ExecutionFrame) SetAttrReadTracker(tracker *AttrReadTracker) {
+	if f.ctx == nil {
+		f.ctx = evalContextPool.Get().(*evalContext)
+	}
+	f.ctx.attrReads = tracker
+	f.attrReadTracker = tracker
+}
+
+// attrReadPrefix 沿当前帧的循环/绑定作用域链查找局部变量在本次求值中对应的具体顶层输入
+// 路径前缀（例如列表循环元素 "items[1]"、Map 循环值 "m[\"k\"]"）。rooted 为 false 表示
+// 该局部变量由循环/绑定作用域持有但无法回溯到顶层输入路径（如 Map 键变量）。
+func (f *ExecutionFrame) attrReadPrefix(name string) (prefix string, rooted, handled bool) {
+	for cur := f; cur != nil; cur = cur.parent {
+		if fd, ok := cur.scope.(*folder); ok {
+			if prefix, rooted, handled := fd.attrReadPrefix(name); handled {
+				return prefix, rooted, true
+			}
+		}
+	}
+	return "", false, false
 }
 
 // ComputeResult tracks and computes the result of the given asynchronous function.

@@ -181,8 +181,19 @@ func numericValueEquals(value any, celValue ref.Val) bool {
 // AttributePattern matches with PartialActivation inputs.
 func NewPartialAttributeFactory(container *containers.Container, adapter types.Adapter, provider types.Provider, opts ...AttrFactoryOption) AttributeFactory {
 	fac := NewAttributeFactory(container, adapter, provider, opts...)
+	return NewPartialAttributeFactoryFrom(fac, container, adapter, provider)
+}
+
+// NewPartialAttributeFactoryFrom wraps an existing AttributeFactory with the unknown attribute
+// pattern matching behavior, while delegating concrete attribute and qualifier creation to the
+// supplied factory.
+//
+// This permits layering additional factory behavior, such as attribute read tracking, beneath the
+// partial-evaluation layer so that pattern matching short-circuits to Unknown values without
+// recording reads, while delegated resolutions retain the inner factory's behavior.
+func NewPartialAttributeFactoryFrom(inner AttributeFactory, container *containers.Container, adapter types.Adapter, provider types.Provider) AttributeFactory {
 	return &partialAttributeFactory{
-		AttributeFactory: fac,
+		AttributeFactory: inner,
 		container:        container,
 		adapter:          adapter,
 		provider:         provider,

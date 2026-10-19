@@ -63,6 +63,7 @@ go_library(
 go_test(
     name = "go_default_test",
     srcs = [
+        "attributereads_test.go",
         "cel_example_test.go",
         "cel_test.go",
         "cost_test.go",

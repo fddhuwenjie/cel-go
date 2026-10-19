@@ -781,6 +781,19 @@ const (
 	// OptTrackMemory enables the runtime peak memory tracking and returns the peak watermark within
 	// evalDetails via func PeakMemory()
 	OptTrackMemory EvalOption = 1 << iota
+
+	// OptTrackAttributeReads 开启运行时的输入属性读取追踪，并通过 EvalDetails 的
+	// AttributeReads() 方法返回本次求值实际读取的顶层输入字段路径。
+	//
+	// 每条路径从顶层输入变量开始、到实际完成读取的叶属性为止，例如 "request.user.name"
+	// 或 "items[1].price"；用作下标的顶层变量和用作循环范围的顶层集合也会记录其变量路径；
+	// 动态键和列表下标按本次真实取值展开；读取按发生顺序记录并保留重复项；循环提前结束、
+	// 条件分支和布尔短路中未执行的路径不会出现；成功的 has 字段存在性检查同样计入。求值
+	// 失败时保留失败前已完成的读取，未成功解析的路径不计入。
+	//
+	// 该选项为按次求值追踪：同一 Program 被并发复用时，各次求值的读取记录彼此隔离。可与
+	// OptTrackState、OptTrackCost、OptTrackMemory 等选项同时开启，各自的结果互不影响。
+	OptTrackAttributeReads EvalOption = 1 << iota
 )
 
 // EvalOptions sets one or more evaluation options which may affect the evaluation or Result.

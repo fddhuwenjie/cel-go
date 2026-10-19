@@ -65,6 +65,7 @@ type planner struct {
 	decorators         []InterpretableDecoratorV2
 	observers          []StatefulObserver
 	costTrackerFactory func() (*CostTracker, error)
+	attrReadTracking   bool
 }
 
 type planBuilder struct {
@@ -92,6 +93,9 @@ func (p *planner) Plan(expr ast.Expr) (InterpretableV2, error) {
 	}
 	if p.costTrackerFactory != nil {
 		i = &costTrackingInterpretable{InterpretableV2: i, factory: p.costTrackerFactory}
+	}
+	if p.attrReadTracking {
+		i = &attrReadTrackingInterpretable{InterpretableV2: i}
 	}
 	if len(p.observers) == 0 {
 		return i, nil

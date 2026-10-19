@@ -37,8 +37,9 @@ type Program interface {
 	//
 	// The vars value may either be an `Activation` or a `map[string]any`.
 	//
-	// If the `OptTrackState`, `OptTrackCost` or `OptExhaustiveEval` flags are used, the `details` response will
-	// be non-nil. Given this caveat on `details`, the return state from evaluation will be:
+	// If the `OptTrackState`, `OptTrackCost`, `OptTrackMemory`, `OptTrackAttributeReads`, or
+	// `OptExhaustiveEval` flags are used, the `details` response will be non-nil. Given this
+	// caveat on `details`, the return state from evaluation will be:
 	//
 	// *  `val`, `details`, `nil` - Successful evaluation of a non-error result.
 	// *  `val`, `details`, `err` - Successful evaluation to an error result.
@@ -190,6 +191,7 @@ type EvalDetails struct {
 	state       interpreter.EvalState
 	costTracker *cost.Tracker
 	memTracker  *types.MemoryTracker
+	attrReads   *interpreter.AttrReadTracker
 }
 
 // State of the evaluation, non-nil if the OptTrackState or OptExhaustiveEval is specified
@@ -221,6 +223,20 @@ func (ed *EvalDetails) PeakMemory() *uint32 {
 	return &peak
 }
 
+// AttributeReads 返回本次求值实际读取的顶层输入属性路径，未开启 OptTrackAttributeReads
+// 时返回 nil。
+//
+// 每条路径从顶层输入变量开始、到实际完成读取的叶属性为止，例如 "request.user.name" 或
+// "items[1].price"。结果按读取发生顺序排列并保留重复项；返回的是一份拷贝，调用方可以
+// 自由修改而不会影响求值内部状态。该方法可用于审计决策依据，以及判断输入变化是否需要
+// 重新求值。
+func (ed *EvalDetails) AttributeReads() []string {
+	if ed == nil || ed.attrReads == nil {
+		return nil
+	}
+	return ed.attrReads.Reads()
+}
+
 // EvalResult encapsulates the response from a ConcurrentEval call.
 type EvalResult struct {
 	Val         ref.Val
@@ -242,6 +258,23 @@ func captureCostTracker(det *EvalDetails, frame *interpreter.ExecutionFrame) *Ev
 		det = &EvalDetails{}
 	}
 	det.costTracker = tracker
+	return det
+}
+
+// captureAttrReadTracker records the frame's attribute read tracker within the evaluation
+// details, allocating the details when attribute read tracking is enabled.
+//
+// The tracker is captured even when evaluation fails or panics so that the reads completed
+// before the failure remain auditable.
+func captureAttrReadTracker(det *EvalDetails, frame *interpreter.ExecutionFrame) *EvalDetails {
+	tracker := frame.AttrReadTracker()
+	if tracker == nil {
+		return det
+	}
+	if det == nil {
+		det = &EvalDetails{}
+	}
+	det.attrReads = tracker
 	return det
 }
 
@@ -348,11 +381,24 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
 			return nil, errors.New("the AST extension 'json_name' requires the option cel.JSONFieldNames(true)")
 		}
 	}
-	// Configure the type provider, considering whether the AST indicates whether it supports JSON field names
+	// 属性读取追踪工厂必须位于部分求值工厂内层：未知模式短路时不记录读取，委托到内部
+	// 根属性的正常解析才会产生读取路径。
+	trackReads := p.evalOpts&OptTrackAttributeReads == OptTrackAttributeReads
 	if p.evalOpts&OptPartialEval == OptPartialEval {
-		attrFactory = interpreter.NewPartialAttributeFactory(e.Container, e.adapter, e.provider, attrFactorOpts...)
+		var innerFactory interpreter.AttributeFactory
+		if trackReads {
+			innerFactory = interpreter.NewAttributeReadTrackingFactory(
+				interpreter.NewAttributeFactory(e.Container, e.adapter, e.provider, attrFactorOpts...),
+				e.Container, e.adapter, e.provider)
+		} else {
+			innerFactory = interpreter.NewAttributeFactory(e.Container, e.adapter, e.provider, attrFactorOpts...)
+		}
+		attrFactory = interpreter.NewPartialAttributeFactoryFrom(innerFactory, e.Container, e.adapter, e.provider)
 	} else {
 		attrFactory = interpreter.NewAttributeFactory(e.Container, e.adapter, e.provider, attrFactorOpts...)
+		if trackReads {
+			attrFactory = interpreter.NewAttributeReadTrackingFactory(attrFactory, e.Container, e.adapter, e.provider)
+		}
 	}
 	interp := interpreter.NewInterpreter(disp, e.Container, e.provider, e.adapter, attrFactory)
 	p.interpreter = interp
@@ -447,6 +493,10 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
 			plannerOptions = append(plannerOptions, observers...)
 		}
 	}
+	// 属性读取追踪在每次求值开始时安装私有的追踪器，可与状态/成本/内存观察者叠加。
+	if trackReads {
+		plannerOptions = append(plannerOptions, interpreter.AttributeReadTracking())
+	}
 	return p.initInterpretable(a, plannerOptions)
 }
 
@@ -488,6 +538,7 @@ func (p *prog) Eval(input any) (out ref.Val, det *EvalDetails, err error) {
 	// Configure error recovery and details capture for evaluation.
 	defer func() {
 		det = captureCostTracker(det, frame)
+		det = captureAttrReadTracker(det, frame)
 		if r := recover(); r != nil {
 			switch t := r.(type) {
 			case interpreter.EvalCancelledError:
@@ -644,6 +695,7 @@ func (p *prog) ConcurrentEval(ctx context.Context, input any) <-chan EvalResult 
 				return
 			}
 			det = captureCostTracker(det, frame)
+			det = captureAttrReadTracker(det, frame)
 			switch t := r.(type) {
 			case interpreter.EvalCancelledError:
 				resCh <- EvalResult{EvalDetails: det, Err: t}
@@ -676,6 +728,7 @@ func (p *prog) ConcurrentEval(ctx context.Context, input any) <-chan EvalResult 
 			// Capture the cost tracker before the result is published on the channel: once the
 			// send completes the receiver owns the details and they must not be mutated.
 			det = captureCostTracker(det, frame)
+			det = captureAttrReadTracker(det, frame)
 
 			// Communicate errors quickly.
 			if types.IsError(out) {
